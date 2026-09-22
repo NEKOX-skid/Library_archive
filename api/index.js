@@ -6,7 +6,7 @@ import net from "node:net";
 
 const sql=neon(process.env.DATABASE_URL);
 const categories=["Anime","Games","Series","Movies","Music","Other"];
-const sessions=new Map();
+
 
 function cookie(name,value,maxAge=604800){return `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`}
 function parseCookies(req){const out={};for(const p of (req.headers.cookie||"").split(";")){const i=p.indexOf("=");if(i>0)out[p.slice(0,i).trim()]=decodeURIComponent(p.slice(i+1).trim())}return out}
@@ -14,7 +14,7 @@ function send(res,status,data,headers={}){res.statusCode=status;for(const [k,v] 
 function security(res){res.setHeader("X-Content-Type-Options","nosniff");res.setHeader("X-Frame-Options","DENY");res.setHeader("Referrer-Policy","no-referrer");res.setHeader("Permissions-Policy","camera=(),microphone=(),geolocation=()");res.setHeader("Content-Security-Policy","default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self' https: data:; style-src 'self'; script-src 'self'; object-src 'none'")}
 function token(){return crypto.randomBytes(32).toString("hex")}
 function sessionUser(req){const c=parseCookies(req),s=sessions.get(c.la_session);return s?.expires>Date.now()?s.user:null}
-function csrfFor(req){const c=parseCookies(req);return sessions.get(c.la_session)?.csrf}
+function csrfFor(req){return readSession(req)?.csrf}
 function requireCsrf(req,res){const expected=csrfFor(req),got=req.headers["x-csrf-token"];return expected&&got&&crypto.timingSafeEqual(Buffer.from(expected),Buffer.from(got))}
 async function body(req){let s="";for await(const chunk of req)s+=chunk;if(s.length>32768)throw Error("Payload too large");return s?JSON.parse(s):{}}
 async function init(){await sql`CREATE TABLE IF NOT EXISTS users(id SERIAL PRIMARY KEY,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL DEFAULT 'user',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;await sql`CREATE TABLE IF NOT EXISTS media(id SERIAL PRIMARY KEY,title TEXT NOT NULL,category TEXT NOT NULL,season TEXT,quality TEXT,url TEXT NOT NULL,description TEXT,poster TEXT,status TEXT NOT NULL DEFAULT 'unknown',last_checked TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`}
@@ -32,9 +32,9 @@ export default async function handler(req,res){
   try{
     await initOnce();
     const url=new URL(req.url,"https://library.local"), path=url.pathname, method=req.method;
-    const user=sessionUser(req);
+    const sess=readSession(req);const user=sess? (await sql`SELECT id,email,role FROM users WHERE id=${sess.id}`)[0] : null;
     if(path==="/api/me"&&method==="GET")return send(res,200,{user:user||null});
-    if(path==="/api/csrf"&&method==="GET"){if(!user)return send(res,401,{error:"Login required"});const c=parseCookies(req),s=sessions.get(c.la_session);if(!s.csrf)s.csrf=token();return send(res,200,{token:s.csrf})}
+    if(path==="/api/csrf"&&method==="GET"){if(!user)return send(res,401,{error:"Login required"});const s=readSession(req);return send(res,200,{token:s.csrf})}
     if(path==="/api/signup"&&method==="POST"){
       if(!allowed("signup:"+ip(req),5,900000))return send(res,429,{error:"Too many signup attempts"});
       const b=await body(req),email=String(b.email||"").trim().toLowerCase(),password=String(b.password||""),invite=String(b.invite||"");
@@ -43,15 +43,15 @@ export default async function handler(req,res){
       if((await sql`SELECT id FROM users WHERE email=${email}`).length)return send(res,409,{error:"Account already exists"});
       const role=process.env.ADMIN_EMAIL?.trim().toLowerCase()===email?"admin":"user";
       const rows=await sql`INSERT INTO users(email,password_hash,role) VALUES(${email},${bcrypt.hashSync(password,12)},${role}) RETURNING id,email,role`;
-      const sid=token(),csrf=token();sessions.set(sid,{user:rows[0],csrf,expires:Date.now()+604800000});res.setHeader("Set-Cookie",[cookie("la_session",sid)]);return send(res,200,{user:rows[0],csrf});
+      const csrf=token(),sid=makeSession(rows[0],csrf);res.setHeader("Set-Cookie",[cookie("la_session",sid)]);return send(res,200,{user:rows[0],csrf});
     }
     if(path==="/api/login"&&method==="POST"){
       if(!allowed("login:"+ip(req),10,600000))return send(res,429,{error:"Too many login attempts"});
       const b=await body(req),email=String(b.email||"").trim().toLowerCase(),password=String(b.password||"");const rows=await sql`SELECT * FROM users WHERE email=${email}`;
       if(!rows.length||!bcrypt.compareSync(password,rows[0].password_hash))return send(res,401,{error:"Invalid email or password"});
-      const u={id:rows[0].id,email:rows[0].email,role:rows[0].role},sid=token(),csrf=token();sessions.set(sid,{user:u,csrf,expires:Date.now()+604800000});res.setHeader("Set-Cookie",[cookie("la_session",sid)]);return send(res,200,{user:u,csrf});
+      const u={id:rows[0].id,email:rows[0].email,role:rows[0].role},csrf=token(),sid=makeSession(u,csrf);res.setHeader("Set-Cookie",[cookie("la_session",sid)]);return send(res,200,{user:u,csrf});
     }
-    if(path==="/api/logout"&&method==="POST"){if(!requireCsrf(req,res))return send(res,403,{error:"CSRF check failed"});const c=parseCookies(req);sessions.delete(c.la_session);res.setHeader("Set-Cookie",cookie("la_session","",0));return send(res,200,{ok:true})}
+    if(path==="/api/logout"&&method==="POST"){if(!requireCsrf(req,res))return send(res,403,{error:"CSRF check failed"});res.setHeader("Set-Cookie",cookie("la_session","",0));return send(res,200,{ok:true})}
     if(!user)return send(res,401,{error:"Login required"});
     if(["POST","DELETE"].includes(method)&&!requireCsrf(req,res))return send(res,403,{error:"CSRF check failed"});
     if(path==="/api/categories"&&method==="GET")return send(res,200,{categories});
